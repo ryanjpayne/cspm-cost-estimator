@@ -1,0 +1,4 @@
+.venv
+aws/cost_report.md
+aws/__pycache__
+aws/templates

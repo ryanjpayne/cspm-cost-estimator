@@ -59,9 +59,15 @@ python generate_cost_report.py --output my_cost_analysis.md
 ### Cost Overview
 
 | Template | Resources | Fixed Monthly Cost |
-|----------|-----------|-------------------|
-| cs_aws_asset_inventory.yaml | 12 | $0.80 |
-| cs_aws_dspm.yaml | 8 | $0.40 |
+|----------|-----------|--------------------|
+| cs_aws_1_click_sensor_management.yaml | 5 | $0.40 |
+| cs_aws_asset_inventory.yaml | 1 | $0.00 |
+| cs_aws_dspm.yaml | 10 | $0.40 |
+| cs_aws_dspm_env.yaml | 33 | $32.85 |
+| cs_aws_realtime_visibility_detection.yaml | 2 | $0.00 |
+| cs_aws_realtime_visibility_detection_eb.yaml | 2 | $0.12 |
+| cs_aws_realtime_visibility_detection_s3.yaml | 5 | $0.00 |
+| cs_aws_root.yaml | 21 | $0.00 |
 ...
 ```
 
@@ -69,13 +75,6 @@ python generate_cost_report.py --output my_cost_analysis.md
 - AWS credentials configured (for Pricing API access)
 - Python packages: `pyyaml`, `boto3`, `requests`
 - `config.ini` file properly configured
-
-**Benefits:**
-- **Time-saving:** Automates the entire workflow in one command
-- **Comprehensive:** Analyzes all templates at once
-- **Professional:** Generates a formatted Markdown report
-- **Actionable:** Includes cost optimization recommendations
-- **Shareable:** Easy to share report with stakeholders
 
 ---
 
@@ -217,9 +216,7 @@ us-west-2 = usw2,bce32e5c
 
 **Features:**
 - Downloads root template and all child templates
-- Resolves CloudFormation intrinsic functions (!Sub, !FindInMap, etc.)
 - Supports additional templates not referenced in root
-- Removes version suffixes from filenames for consistency
 - Configurable via config.ini file
 
 ## Workflow Examples
