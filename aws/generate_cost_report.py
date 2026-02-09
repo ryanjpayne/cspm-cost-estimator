@@ -56,14 +56,21 @@ class CostReportGenerator:
         config_path = os.path.join(self.script_dir, "config.ini")
         if not os.path.exists(config_path):
             print(f"Warning: config.ini not found at {config_path}")
-            return {"output_dir": "templates"}
+            return {"output_dir": "templates", "enabled_services": {}}
 
         config = configparser.ConfigParser()
         config.read(config_path)
 
+        # Load enabled services
+        enabled_services = {}
+        if config.has_section("enabled_services"):
+            for key, value in config.items("enabled_services"):
+                enabled_services[key] = value.lower() == "true"
+
         return {
             "output_dir": config.get("download", "output_dir", fallback="templates"),
             "region": config.get("download", "region", fallback="us-east-1"),
+            "enabled_services": enabled_services,
         }
 
     def step1_download_templates(self) -> bool:
@@ -215,7 +222,7 @@ class CostReportGenerator:
 
     def _write_report_header(self, f):
         """Write report header."""
-        f.write("# CrowdStrike CSPM CloudFormation Cost Estimation Report\n\n")
+        f.write("# CrowdStrike AWS CSPM Cost Estimate\n\n")
         f.write(f"**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
         f.write(f"**Region:** {self.region}\n\n")
         f.write(f"**Templates Directory:** {self.templates_dir}\n\n")
@@ -224,6 +231,8 @@ class CostReportGenerator:
     def _write_executive_summary(self, f):
         """Write executive summary section."""
         f.write("## Executive Summary\n\n")
+
+        f.write("- **Scope:** Per Account\n")
 
         total_templates = len(self.cost_estimates)
         total_resources = sum(
@@ -240,7 +249,28 @@ class CostReportGenerator:
         if self.errors:
             f.write(f"- **Errors Encountered:** {len(self.errors)}\n")
 
-        f.write("\n### Cost Overview\n\n")
+        # Write enabled services section
+        enabled_services = self.config.get("enabled_services", {})
+        if enabled_services:
+            f.write("\n## Enabled Services\n\n")
+
+            # Map config keys to friendly names
+            service_names = {
+                "ioa_eventbridge": "Realtime Visibility with EventBridge",
+                "ioa_s3": "Realtime Visibility with S3",
+                "ioa_cloudtrail": "Realtime Visibility with non-mutating events (additional CloudTrail)",
+                "1click": "1Click",
+                "dspm": "DSPM",
+            }
+
+            for key, enabled in enabled_services.items():
+                if enabled:
+                    friendly_name = service_names.get(key, key)
+                    f.write(f"- {friendly_name}\n")
+
+            f.write("\n")
+
+        f.write("## Cost Overview\n\n")
         f.write("| Template | Resources | Fixed Monthly Cost |\n")
         f.write("|----------|-----------|--------------------|\n")
 
