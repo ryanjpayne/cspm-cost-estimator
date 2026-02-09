@@ -25,6 +25,7 @@ import sys
 import yaml
 import json
 import argparse
+import configparser
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 from decimal import Decimal
@@ -104,14 +105,24 @@ RESOURCE_SERVICE_MAP = {
     "AWS::DynamoDB::Table": "AmazonDynamoDB",
     # Secrets & Parameters
     "AWS::SecretsManager::Secret": "AWSSecretsManager",
-    "AWS::SSM::Parameter": "AWSSystemsManager",
+    "AWS::SSM::Parameter": None,  # Free for standard parameters (up to 10K params, 4KB max, 40 TPS)
     # Networking
-    "AWS::EC2::VPC": "AmazonVPC",
-    "AWS::EC2::Subnet": "AmazonVPC",
-    "AWS::EC2::InternetGateway": "AmazonVPC",
-    "AWS::EC2::RouteTable": "AmazonVPC",
-    "AWS::EC2::SecurityGroup": "AmazonVPC",
-    "AWS::EC2::NatGateway": "AmazonVPC",
+    "AWS::EC2::VPC": None,  # Free - VPCs themselves have no charge
+    "AWS::EC2::Subnet": None,  # Free - Subnets have no charge
+    "AWS::EC2::InternetGateway": None,  # Free - Internet Gateways have no charge
+    "AWS::EC2::RouteTable": None,  # Free - Route Tables have no charge
+    "AWS::EC2::Route": None,  # Free - Routes have no charge
+    "AWS::EC2::SecurityGroup": None,  # Free - Security Groups have no charge
+    "AWS::EC2::NetworkAcl": None,  # Free - Network ACLs have no charge
+    "AWS::EC2::NetworkAclEntry": None,  # Free - NACL entries have no charge
+    "AWS::EC2::VPCGatewayAttachment": None,  # Free - Gateway attachments have no charge
+    "AWS::EC2::SubnetRouteTableAssociation": None,  # Free - Route table associations have no charge
+    "AWS::EC2::SubnetNetworkAclAssociation": None,  # Free - NACL associations have no charge
+    "AWS::EC2::VPCEndpoint": None,  # Free for Gateway endpoints (S3, DynamoDB)
+    "AWS::EC2::EIP": None,  # Free when attached, charged when unattached
+    "AWS::EC2::NatGateway": "AmazonVPC",  # Charged resource
+    "AWS::RDS::DBSubnetGroup": None,  # Free - DB Subnet Groups have no charge
+    "AWS::Redshift::ClusterSubnetGroup": None,  # Free - Redshift Subnet Groups have no charge
     # IAM (Free)
     "AWS::IAM::Role": None,  # Free service
     "AWS::IAM::Policy": None,
@@ -129,6 +140,8 @@ RESOURCE_SERVICE_MAP = {
     # CloudWatch
     "AWS::Logs::LogGroup": "AmazonCloudWatch",
     "AWS::CloudWatch::Alarm": "AmazonCloudWatch",
+    # CloudTrail
+    "AWS::CloudTrail::Trail": "AWSCloudTrail",
 }
 
 
@@ -227,15 +240,91 @@ def load_template(template_path: str) -> Dict[str, Any]:
         sys.exit(1)
 
 
-def analyze_resources(template: Dict[str, Any]) -> List[Dict[str, str]]:
+def load_config(config_path: str = "aws/config.ini") -> Dict[str, Any]:
+    """Load configuration from config.ini file."""
+    config = configparser.ConfigParser()
+    try:
+        config.read(config_path)
+        enabled_services = {}
+        if config.has_section("enabled_services"):
+            for key, value in config.items("enabled_services"):
+                enabled_services[key] = value.lower() == "true"
+        return enabled_services
+    except Exception as e:
+        print(f"Warning: Could not load config.ini: {e}")
+        return {}
+
+
+def should_include_template(
+    template_name: str, enabled_services: Dict[str, bool]
+) -> bool:
+    """Determine if a template should be included based on enabled services."""
+    # Always include these templates
+    if template_name in ["cs_aws_asset_inventory.yaml", "cs_aws_root.yaml"]:
+        return True
+
+    # Conditional templates
+    template_conditions = {
+        "cs_aws_1_click_sensor_management.yaml": enabled_services.get("1click", False),
+        "cs_aws_dspm_env.yaml": enabled_services.get("dspm", False),
+        "cs_aws_dspm.yaml": enabled_services.get("dspm", False),
+        "cs_aws_realtime_visibility_detection_eb.yaml": enabled_services.get(
+            "ioa_eventbridge", False
+        ),
+        "cs_aws_realtime_visibility_detection_s3.yaml": enabled_services.get(
+            "ioa_s3", False
+        ),
+        "cs_aws_realtime_visibility_detection.yaml": enabled_services.get(
+            "ioa_eventbridge", False
+        )
+        or enabled_services.get("ioa_s3", False),
+    }
+
+    return template_conditions.get(template_name, False)
+
+
+def should_include_resource(
+    resource_name: str,
+    resource_type: str,
+    template_name: str,
+    enabled_services: Dict[str, bool],
+) -> bool:
+    """Determine if a specific resource should be included based on enabled services."""
+    # Special case: CloudTrail in cs_aws_realtime_visibility_detection.yaml
+    if (
+        resource_type == "AWS::CloudTrail::Trail"
+        and "realtime_visibility_detection.yaml" in template_name
+    ):
+        return enabled_services.get("ioa_cloudtrail", False)
+
+    # By default, include all resources if the template is included
+    return True
+
+
+def analyze_resources(
+    template: Dict[str, Any],
+    template_name: str = "",
+    enabled_services: Dict[str, bool] = None,
+) -> List[Dict[str, str]]:
     """Extract resource information from the template."""
+    if enabled_services is None:
+        enabled_services = {}
+
     resources = template.get("Resources", {})
     resource_list = []
 
     for resource_name, resource_data in resources.items():
+        resource_type = resource_data.get("Type", "N/A")
+
+        # Check if this resource should be included
+        if not should_include_resource(
+            resource_name, resource_type, template_name, enabled_services
+        ):
+            continue
+
         resource_info = {
             "name": resource_name,
-            "type": resource_data.get("Type", "N/A"),
+            "type": resource_type,
             "condition": resource_data.get("Condition", "None"),
             "properties": resource_data.get("Properties", {}),
         }
@@ -310,6 +399,229 @@ def estimate_nat_gateway_cost(
         "unit": "per hour",
         "notes": f"${hourly_price if hourly_price else 0.045}/hour + data processing charges (~${monthly_cost:.2f}/month)",
         "pricing_available": price_item is not None,
+    }
+
+
+def estimate_cloudtrail_cost(
+    pricing_client: AWSPricingClient, region: str
+) -> Dict[str, Any]:
+    """Estimate CloudTrail costs for additional trail.
+
+    Note: The first copy of management events is free. Additional trails incur charges.
+    This function assumes this is an additional trail (not the first free one).
+    """
+    # CloudTrail pricing: $2.00 per 100,000 management events delivered to S3
+    # (after the first free copy)
+    price_per_100k_events = 2.00
+
+    # Estimate based on typical production account activity
+    # Conservative estimate: 1 million management events per month
+    # This can vary significantly based on:
+    # - Number of users/services making API calls
+    # - Automation and CI/CD pipelines
+    # - Application activity levels
+    estimated_events_per_month = 1_000_000
+    estimated_monthly_cost = (
+        estimated_events_per_month / 100_000
+    ) * price_per_100k_events
+
+    return {
+        "monthly_cost": estimated_monthly_cost,
+        "unit_cost": price_per_100k_events,
+        "unit": "per 100K events",
+        "notes": (
+            f"${price_per_100k_events:.2f} per 100,000 management events delivered to S3 (after first free copy). "
+            f"Estimated {estimated_events_per_month:,} events/month = ${estimated_monthly_cost:.2f}/month. "
+            "Note: First trail copy is free. This pricing applies to additional trails. "
+            "Actual costs vary significantly based on account activity: "
+            "Low-activity accounts may see <100K events/month ($2/month), "
+            "while high-activity accounts with extensive automation can exceed 10M events/month ($200+/month). "
+            "Data events (S3/Lambda) incur additional charges if enabled."
+        ),
+        "pricing_available": True,
+    }
+
+
+def estimate_sqs_cost(
+    pricing_client: AWSPricingClient, region: str, properties: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Estimate SQS Queue costs.
+
+    SQS pricing structure:
+    1. Standard Queue: First 1M requests/month free, then $0.40 per million requests
+    2. FIFO Queue: First 1M requests/month free, then $0.50 per million requests
+    3. Data transfer: Standard AWS data transfer rates apply
+
+    Args:
+        pricing_client: AWS Pricing API client
+        region: AWS region
+        properties: CloudFormation resource properties (to check queue type)
+
+    Returns:
+        Dictionary with cost information
+    """
+    # Determine if this is a FIFO queue
+    queue_name = properties.get("QueueName", "")
+    is_fifo = (
+        queue_name.endswith(".fifo")
+        if isinstance(queue_name, str)
+        else properties.get("FifoQueue", False)
+    )
+
+    # Get SQS pricing from API
+    queue_type = "FIFO" if is_fifo else "Standard"
+    filters = [
+        {"Type": "TERM_MATCH", "Field": "location", "Value": region},
+        {"Type": "TERM_MATCH", "Field": "queueType", "Value": queue_type},
+    ]
+
+    price_item = pricing_client.get_service_pricing("AmazonSQS", filters)
+    price_per_million = (
+        pricing_client.extract_price_from_item(price_item)
+        if price_item
+        else (0.50 if is_fifo else 0.40)
+    )
+
+    # Estimate based on typical CloudTrail S3 notification usage
+    # Conservative estimate for CloudTrail S3 notifications:
+    # - Assume moderate CloudTrail activity: 10,000 S3 objects/month
+    # - Each S3 object triggers 1 SQS message
+    # - CrowdStrike polls queue: ~1 receive per message
+    # - Total: 10,000 sends + 10,000 receives + 10,000 deletes = 30,000 requests/month
+    # This is well within the 1M free tier
+    estimated_requests_per_month = 30_000
+
+    # Calculate cost (accounting for 1M free tier)
+    free_tier_requests = 1_000_000
+    billable_requests = max(0, estimated_requests_per_month - free_tier_requests)
+    estimated_monthly_cost = (billable_requests / 1_000_000) * price_per_million
+
+    # Build notes
+    queue_type_note = "FIFO queue" if is_fifo else "Standard queue"
+    free_tier_note = (
+        "within free tier"
+        if estimated_requests_per_month <= free_tier_requests
+        else f"{billable_requests:,} billable requests"
+    )
+
+    notes = (
+        f"{queue_type_note}: ${price_per_million:.2f} per million requests (after 1M free tier). "
+        f"Estimated {estimated_requests_per_month:,} requests/month ({free_tier_note}) "
+        f"= ${estimated_monthly_cost:.4f}/month. "
+        "Based on ~10K CloudTrail S3 objects/month with 3 operations each (send, receive, delete). "
+        "Actual costs vary significantly based on CloudTrail volume and polling frequency. "
+        "High-activity accounts can generate 100K-1M+ messages/month."
+    )
+
+    return {
+        "monthly_cost": estimated_monthly_cost,
+        "unit_cost": price_per_million,
+        "unit": "per 1M requests",
+        "notes": notes,
+        "pricing_available": price_item is not None,
+    }
+
+
+def estimate_cloudwatch_logs_cost(
+    pricing_client: AWSPricingClient, region: str, properties: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Estimate CloudWatch Logs costs.
+
+    CloudWatch Logs has two main cost components:
+    1. Log Ingestion: $0.50 per GB ingested
+    2. Log Storage: $0.03 per GB per month
+
+    Args:
+        pricing_client: AWS Pricing API client
+        region: AWS region
+        properties: CloudFormation resource properties (to check retention settings)
+
+    Returns:
+        Dictionary with cost information
+    """
+    # Get log ingestion pricing
+    filters = [
+        {"Type": "TERM_MATCH", "Field": "location", "Value": region},
+        {"Type": "TERM_MATCH", "Field": "productFamily", "Value": "Data Ingestion"},
+        {"Type": "TERM_MATCH", "Field": "groupDescription", "Value": "Log Ingestion"},
+    ]
+
+    ingestion_price_item = pricing_client.get_service_pricing(
+        "AmazonCloudWatch", filters
+    )
+    ingestion_price_per_gb = (
+        pricing_client.extract_price_from_item(ingestion_price_item)
+        if ingestion_price_item
+        else 0.50
+    )
+
+    # Get log storage pricing
+    storage_filters = [
+        {"Type": "TERM_MATCH", "Field": "location", "Value": region},
+        {"Type": "TERM_MATCH", "Field": "productFamily", "Value": "Log Storage"},
+        {"Type": "TERM_MATCH", "Field": "groupDescription", "Value": "Log Storage"},
+    ]
+
+    storage_price_item = pricing_client.get_service_pricing(
+        "AmazonCloudWatch", storage_filters
+    )
+    storage_price_per_gb = (
+        pricing_client.extract_price_from_item(storage_price_item)
+        if storage_price_item
+        else 0.03
+    )
+
+    # Get retention period from properties (default to 0 = never expire)
+    retention_days = properties.get("RetentionInDays", 0)
+
+    # Estimate usage based on typical Lambda function logging
+    # Conservative estimate for Lambda logs:
+    # - Assume moderate Lambda activity: 10,000 invocations/month
+    # - Average log size per invocation: 2 KB
+    # - Total ingestion: 10,000 * 2 KB = 20 MB = 0.02 GB/month
+    estimated_ingestion_gb_per_month = 0.02
+
+    # Calculate storage based on retention
+    # With short retention (e.g., 1 day), storage is minimal
+    # Average storage = (ingestion per day * retention days) / 2
+    if retention_days > 0:
+        daily_ingestion_gb = estimated_ingestion_gb_per_month / 30
+        avg_storage_gb = (daily_ingestion_gb * retention_days) / 2
+    else:
+        # No retention limit - assume 30 days average for estimation
+        avg_storage_gb = estimated_ingestion_gb_per_month
+
+    # Calculate costs
+    ingestion_cost = estimated_ingestion_gb_per_month * ingestion_price_per_gb
+    storage_cost = avg_storage_gb * storage_price_per_gb
+    total_monthly_cost = ingestion_cost + storage_cost
+
+    # Build notes
+    retention_note = (
+        f"{retention_days} days"
+        if retention_days > 0
+        else "Never expire (indefinite retention)"
+    )
+
+    notes = (
+        f"Log Ingestion: ${ingestion_price_per_gb:.2f}/GB, "
+        f"Log Storage: ${storage_price_per_gb:.2f}/GB/month. "
+        f"Retention: {retention_note}. "
+        f"Estimated {estimated_ingestion_gb_per_month:.3f} GB ingestion/month "
+        f"(~10K Lambda invocations at 2KB/invocation) = ${ingestion_cost:.4f}/month ingestion. "
+        f"Estimated {avg_storage_gb:.4f} GB average storage = ${storage_cost:.4f}/month storage. "
+        f"Total estimated: ${total_monthly_cost:.4f}/month. "
+        "Actual costs vary significantly based on log volume and retention. "
+        "High-traffic applications can generate 10-100x more logs."
+    )
+
+    return {
+        "monthly_cost": total_monthly_cost,
+        "unit_cost": ingestion_price_per_gb,
+        "unit": "per GB ingested",
+        "notes": notes,
+        "pricing_available": ingestion_price_item is not None
+        or storage_price_item is not None,
     }
 
 
@@ -409,13 +721,19 @@ def estimate_resource_cost(
 
     # Handle free services
     if service_code is None:
+        # Special note for SSM Parameters
+        if resource_type == "AWS::SSM::Parameter":
+            notes = "Standard parameters are free: Up to 10,000 parameters per region, 4KB maximum size, and 40 transactions per second (TPS). Advanced parameters incur charges."
+        else:
+            notes = "No charge for this resource"
+
         return {
             "resource_name": resource_name,
             "resource_type": resource_type,
             "monthly_cost": 0.0,
             "unit_cost": 0.0,
             "unit": "N/A",
-            "notes": "No charge for this resource",
+            "notes": notes,
             "condition": resource.get("condition", "None"),
             "service": resource_type.split("::")[1] if "::" in resource_type else "AWS",
             "pricing_available": True,
@@ -428,10 +746,22 @@ def estimate_resource_cost(
         cost_info = estimate_secrets_manager_cost(pricing_client, region)
     elif resource_type == "AWS::EC2::NatGateway":
         cost_info = estimate_nat_gateway_cost(pricing_client, region)
+    elif resource_type == "AWS::CloudTrail::Trail":
+        cost_info = estimate_cloudtrail_cost(pricing_client, region)
     elif resource_type == "AWS::Events::Rule":
         # EventBridge rules may incur data transfer costs for cross-account delivery
         cost_info = estimate_eventbridge_data_transfer_cost(
             pricing_client, region, resource.get("properties", {}), template_path
+        )
+    elif resource_type == "AWS::Logs::LogGroup":
+        # CloudWatch Log Groups have ingestion and storage costs
+        cost_info = estimate_cloudwatch_logs_cost(
+            pricing_client, region, resource.get("properties", {})
+        )
+    elif resource_type == "AWS::SQS::Queue":
+        # SQS Queues have request-based costs with free tier
+        cost_info = estimate_sqs_cost(
+            pricing_client, region, resource.get("properties", {})
         )
     else:
         # Generic pricing lookup
@@ -584,11 +914,55 @@ def main():
         default="us-east-1",
         help="AWS region for pricing (default: us-east-1)",
     )
+    parser.add_argument(
+        "--config",
+        default="aws/config.ini",
+        help="Path to config.ini file (default: aws/config.ini)",
+    )
 
     args = parser.parse_args()
 
+    # Load enabled services configuration
+    enabled_services = load_config(args.config)
+
+    # Extract template filename
+    template_name = Path(args.template).name
+
+    # Check if this template should be included based on enabled services
+    if enabled_services and not should_include_template(
+        template_name, enabled_services
+    ):
+        print(f"\nTemplate '{template_name}' is disabled in config.ini")
+        print(
+            "To include this template in cost estimates, enable the corresponding service in [enabled_services] section:"
+        )
+        print("=" * 100)
+
+        # Provide helpful message about which service to enable
+        service_hints = {
+            "cs_aws_1_click_sensor_management.yaml": "1click = true",
+            "cs_aws_dspm_env.yaml": "dspm = true",
+            "cs_aws_dspm.yaml": "dspm = true",
+            "cs_aws_realtime_visibility_detection_eb.yaml": "ioa_eventbridge = true",
+            "cs_aws_realtime_visibility_detection_s3.yaml": "ioa_s3 = true",
+            "cs_aws_realtime_visibility_detection.yaml": "ioa_eventbridge = true or ioa_s3 = true",
+        }
+
+        if template_name in service_hints:
+            print(f"Set: {service_hints[template_name]}")
+
+        print("=" * 100)
+        return
+
     print(f"\nEstimating costs for CloudFormation template: {args.template}")
     print(f"Region: {args.region}")
+
+    if enabled_services:
+        print("\nEnabled services from config.ini:")
+        for service, enabled in enabled_services.items():
+            status = "✓ enabled" if enabled else "✗ disabled"
+            print(f"  {service}: {status}")
+
     print("=" * 100)
 
     # Initialize pricing client
@@ -598,8 +972,8 @@ def main():
     # Load and parse template
     template = load_template(args.template)
 
-    # Analyze resources
-    resources = analyze_resources(template)
+    # Analyze resources (with filtering based on enabled services)
+    resources = analyze_resources(template, template_name, enabled_services)
 
     print(f"\nFound {len(resources)} resources in template")
     print()
@@ -626,6 +1000,7 @@ def main():
         "• Usage-based resources show $0.00 but will incur costs based on actual usage"
     )
     print("• Pricing data retrieved from AWS Pricing API")
+    print("• Resources filtered based on enabled_services in config.ini")
     print("• Always refer to AWS Pricing Calculator for detailed estimates:")
     print("  https://calculator.aws/")
     print("=" * 100)
