@@ -135,8 +135,13 @@ RESOURCE_SERVICE_MAP = {
     "AWS::Events::Rule": "AmazonEventBridge",
     # SNS
     "AWS::SNS::Topic": "AmazonSNS",
+    "AWS::SNS::Subscription": None,  # Free - subscriptions themselves have no charge (delivery costs apply)
     # SQS
     "AWS::SQS::Queue": "AmazonSQS",
+    "AWS::SQS::QueuePolicy": None,  # Free - policies have no charge
+    # KMS
+    "AWS::KMS::Key": "awskms",
+    "AWS::KMS::Alias": None,  # Free - aliases have no charge
     # CloudWatch
     "AWS::Logs::LogGroup": "AmazonCloudWatch",
     "AWS::CloudWatch::Alarm": "AmazonCloudWatch",
@@ -381,7 +386,20 @@ def estimate_secrets_manager_cost(
 def estimate_nat_gateway_cost(
     pricing_client: AWSPricingClient, region: str
 ) -> Dict[str, Any]:
-    """Estimate NAT Gateway costs."""
+    """Estimate NAT Gateway costs.
+
+    NAT Gateway has two cost components:
+    1. Hourly charge: $0.045/hour (~$32.85/month)
+    2. Data processing: $0.045/GB processed
+
+    Args:
+        pricing_client: AWS Pricing API client
+        region: AWS region
+
+    Returns:
+        Dictionary with cost information
+    """
+    # Get hourly NAT Gateway pricing
     filters = [
         {"Type": "TERM_MATCH", "Field": "location", "Value": region},
         {"Type": "TERM_MATCH", "Field": "productFamily", "Value": "NAT Gateway"},
@@ -391,13 +409,46 @@ def estimate_nat_gateway_cost(
     hourly_price = (
         pricing_client.extract_price_from_item(price_item) if price_item else 0.045
     )
-    monthly_cost = hourly_price * 730 if hourly_price else 32.85
+    monthly_hourly_cost = hourly_price * 730 if hourly_price else 32.85
+
+    # Data processing charge: $0.045 per GB
+    data_processing_price_per_gb = 0.045
+
+    # Estimate data processing based on typical usage
+    # Conservative estimate for CSPM/security monitoring:
+    # - Outbound traffic to CrowdStrike APIs: ~10 GB/month
+    # - CloudTrail log forwarding: ~5 GB/month
+    # - Other API calls and monitoring: ~5 GB/month
+    # Total: ~20 GB/month
+    #
+    # Note: Actual usage varies significantly:
+    # - Light usage: 5-20 GB/month ($0.23-$0.90/month)
+    # - Medium usage: 50-200 GB/month ($2.25-$9/month)
+    # - Heavy usage: 500+ GB/month ($22.50+/month)
+    estimated_data_gb_per_month = 20
+    estimated_data_processing_cost = (
+        estimated_data_gb_per_month * data_processing_price_per_gb
+    )
+
+    # Total monthly cost
+    total_monthly_cost = monthly_hourly_cost + estimated_data_processing_cost
+
+    notes = (
+        f"NAT Gateway hourly: ${hourly_price if hourly_price else 0.045}/hour = ${monthly_hourly_cost:.2f}/month. "
+        f"Data processing: ${data_processing_price_per_gb:.3f}/GB. "
+        f"Estimated {estimated_data_gb_per_month} GB/month = ${estimated_data_processing_cost:.2f}/month data processing. "
+        f"Total estimated: ${total_monthly_cost:.2f}/month. "
+        "Actual data processing costs vary significantly based on traffic volume: "
+        "Light usage (5-20 GB/month) adds $0.23-$0.90/month, "
+        "medium usage (50-200 GB/month) adds $2.25-$9/month, "
+        "heavy usage (500+ GB/month) adds $22.50+/month."
+    )
 
     return {
-        "monthly_cost": monthly_cost,
+        "monthly_cost": total_monthly_cost,
         "unit_cost": hourly_price if hourly_price else 0.045,
-        "unit": "per hour",
-        "notes": f"${hourly_price if hourly_price else 0.045}/hour + data processing charges (~${monthly_cost:.2f}/month)",
+        "unit": "per hour + $0.045/GB",
+        "notes": notes,
         "pricing_available": price_item is not None,
     }
 
@@ -625,13 +676,146 @@ def estimate_cloudwatch_logs_cost(
     }
 
 
+def estimate_kms_cost(
+    pricing_client: AWSPricingClient, region: str, properties: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Estimate KMS customer managed key costs.
+
+    KMS Pricing:
+    - Customer managed keys: $1.00 per month per key
+    - API requests: $0.03 per 10,000 requests (after free tier)
+    - Free tier: 20,000 requests per month
+
+    Args:
+        pricing_client: AWS Pricing API client
+        region: AWS region
+        properties: CloudFormation resource properties
+
+    Returns:
+        Dictionary with cost information
+    """
+    # Get KMS pricing from API
+    filters = [
+        {"Type": "TERM_MATCH", "Field": "location", "Value": region},
+        {"Type": "TERM_MATCH", "Field": "productFamily", "Value": "Key Management"},
+    ]
+
+    price_item = pricing_client.get_service_pricing("awskms", filters)
+    monthly_key_cost = (
+        pricing_client.extract_price_from_item(price_item) if price_item else 1.00
+    )
+
+    # Note: API request costs are usage-based and not estimated here
+    # Free tier: 20,000 requests/month
+    # After free tier: $0.03 per 10,000 requests
+
+    notes = (
+        f"${monthly_key_cost:.2f}/month per customer managed key. "
+        "API requests: $0.03 per 10,000 requests (after 20,000 free tier requests/month). "
+        "Actual API costs depend on encryption/decryption volume. "
+        "Typical usage: 1,000-10,000 requests/month for secrets/parameter encryption."
+    )
+
+    return {
+        "monthly_cost": monthly_key_cost,
+        "unit_cost": monthly_key_cost,
+        "unit": "per key/month",
+        "notes": notes,
+        "pricing_available": price_item is not None,
+    }
+
+
+def estimate_sns_cost(
+    pricing_client: AWSPricingClient, region: str, properties: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Estimate SNS topic costs.
+
+    SNS Pricing (varies by delivery protocol):
+    - HTTP/HTTPS notifications: $0.60 per million requests (after free tier)
+    - Email notifications: $2.00 per 100,000 notifications (after free tier)
+    - SMS: Varies by destination country
+    - Mobile push: $0.50 per million notifications (after free tier)
+    - SQS: $0.00 (free)
+    - Lambda: $0.00 (free)
+    - Free tier: 1,000 email notifications, 1M mobile push, 100K HTTP/HTTPS per month
+
+    Args:
+        pricing_client: AWS Pricing API client
+        region: AWS region
+        properties: CloudFormation resource properties
+
+    Returns:
+        Dictionary with cost information
+    """
+    # For CloudTrail S3 notifications to SQS, SNS is typically used
+    # SNS to SQS delivery is FREE
+    # However, we'll estimate based on HTTP/HTTPS delivery as a conservative estimate
+
+    # Get SNS pricing from API for HTTP/HTTPS delivery
+    filters = [
+        {"Type": "TERM_MATCH", "Field": "location", "Value": region},
+        {
+            "Type": "TERM_MATCH",
+            "Field": "productFamily",
+            "Value": "API Request",
+        },
+    ]
+
+    price_item = pricing_client.get_service_pricing("AmazonSNS", filters)
+    price_per_million = (
+        pricing_client.extract_price_from_item(price_item) if price_item else 0.50
+    )
+
+    # Estimate based on typical CloudTrail S3 notification usage
+    # Conservative estimate:
+    # - 10,000 S3 objects/month (CloudTrail logs)
+    # - Each S3 object triggers 1 SNS notification
+    # - Total: 10,000 notifications/month
+    # This is well within the free tier for most delivery types
+    estimated_notifications_per_month = 10_000
+
+    # For SNS to SQS, delivery is free
+    # For other protocols, apply pricing after free tier
+    free_tier_notifications = 100_000  # HTTP/HTTPS free tier
+    billable_notifications = max(
+        0, estimated_notifications_per_month - free_tier_notifications
+    )
+    estimated_monthly_cost = (billable_notifications / 1_000_000) * price_per_million
+
+    notes = (
+        f"SNS pricing varies by delivery protocol. "
+        f"HTTP/HTTPS: ${price_per_million:.2f} per million (after 100K free tier). "
+        "SNS to SQS/Lambda: FREE. "
+        "Email: $2.00 per 100K (after 1K free tier). "
+        f"Estimated {estimated_notifications_per_month:,} notifications/month "
+        f"(within free tier for most protocols) = ${estimated_monthly_cost:.4f}/month. "
+        "Based on ~10K CloudTrail S3 objects/month. "
+        "Actual costs vary based on notification volume and delivery protocol."
+    )
+
+    return {
+        "monthly_cost": estimated_monthly_cost,
+        "unit_cost": price_per_million,
+        "unit": "per 1M requests",
+        "notes": notes,
+        "pricing_available": price_item is not None,
+    }
+
+
 def estimate_eventbridge_data_transfer_cost(
     pricing_client: AWSPricingClient,
     region: str,
     properties: Dict[str, Any],
     template_path: str = "",
 ) -> Dict[str, Any]:
-    """Estimate EventBridge data transfer costs for cross-account event delivery."""
+    """Estimate EventBridge costs for cross-account event delivery.
+
+    EventBridge Pricing:
+    - Event ingestion: $0.00 per million events (free for AWS management events)
+    - Cross-account delivery: $1.00 per million events delivered to another account
+
+    Reference: https://aws.amazon.com/eventbridge/pricing/
+    """
     # For CrowdStrike EventBridge templates, assume cross-account delivery
     # These templates are specifically designed to forward events to CrowdStrike's account
     is_cross_account = "realtime_visibility_detection_eb" in template_path.lower()
@@ -663,46 +847,47 @@ def estimate_eventbridge_data_transfer_cost(
             "monthly_cost": 0.0,
             "unit_cost": 0.0,
             "unit": "N/A",
-            "notes": "No cross-account data transfer detected",
+            "notes": "No cross-account event delivery detected. Event ingestion is free for AWS management events.",
             "pricing_available": True,
         }
 
-    # Get data transfer out pricing
-    # Data transfer pricing uses AmazonEC2 service code with specific filters
-    filters = [
-        {"Type": "TERM_MATCH", "Field": "location", "Value": region},
-        {"Type": "TERM_MATCH", "Field": "productFamily", "Value": "Data Transfer"},
-        {"Type": "TERM_MATCH", "Field": "transferType", "Value": "AWS Outbound"},
-    ]
-
-    price_item = pricing_client.get_service_pricing("AmazonEC2", filters)
-
-    # Data transfer pricing is tiered, but we'll use first tier (0-10TB) as baseline
-    # Typical pricing: $0.01-$0.02 per GB for first 10TB
-    price_per_gb = (
-        pricing_client.extract_price_from_item(price_item) if price_item else 0.01
-    )
+    # EventBridge cross-account delivery pricing
+    # $1.00 per million events delivered to another account
+    price_per_million_events = 1.00
 
     # Estimate based on typical CloudTrail event volume
-    # Average CloudTrail event size: ~1-5 KB
-    # Typical production account: 10,000 - 1,000,000 events/day
-    # Conservative estimate: 100,000 events/day * 2 KB = 200 MB/day = 6 GB/month
-    estimated_gb_per_month = 6.0
-    estimated_monthly_cost = estimated_gb_per_month * (
-        price_per_gb if price_per_gb else 0.01
-    )
+    # AWS management events are delivered to EventBridge for free (ingestion)
+    # But cross-account delivery incurs charges
+    #
+    # Typical production account activity estimates:
+    # - Low activity: 100K-500K events/month
+    # - Medium activity: 1M-5M events/month
+    # - High activity: 10M+ events/month
+    #
+    # Conservative estimate for a typical production account: 5 million events/month
+    # This aligns with AWS's pricing example
+    estimated_events_per_month = 5_000_000
+
+    # Calculate cost: (events / 1M) * $1.00
+    estimated_monthly_cost = (
+        estimated_events_per_month / 1_000_000
+    ) * price_per_million_events
 
     return {
         "monthly_cost": estimated_monthly_cost,
-        "unit_cost": price_per_gb if price_per_gb else 0.01,
-        "unit": "per GB",
+        "unit_cost": price_per_million_events,
+        "unit": "per 1M events",
         "notes": (
-            f"Cross-account data transfer: ${price_per_gb if price_per_gb else 0.01:.4f}/GB. "
-            f"Estimated {estimated_gb_per_month} GB/month based on ~100K events/day at 2KB/event. "
-            "Actual costs vary significantly based on CloudTrail event volume and event size. "
-            "High-activity accounts may see 10-100x higher costs."
+            f"EventBridge cross-account delivery: ${price_per_million_events:.2f} per million events. "
+            f"Event ingestion is FREE for AWS management events. "
+            f"Estimated {estimated_events_per_month:,} events/month delivered cross-account = ${estimated_monthly_cost:.2f}/month. "
+            "Actual costs vary significantly based on account activity: "
+            "Low-activity accounts may see 100K-500K events/month ($0.10-$0.50/month), "
+            "medium-activity accounts 1M-5M events/month ($1-$5/month), "
+            "while high-activity accounts with extensive automation can exceed 10M events/month ($10+/month). "
+            "Note: Events must be ≤64KB each (larger events count as multiple events)."
         ),
-        "pricing_available": price_item is not None,
+        "pricing_available": True,
     }
 
 
@@ -761,6 +946,16 @@ def estimate_resource_cost(
     elif resource_type == "AWS::SQS::Queue":
         # SQS Queues have request-based costs with free tier
         cost_info = estimate_sqs_cost(
+            pricing_client, region, resource.get("properties", {})
+        )
+    elif resource_type == "AWS::KMS::Key":
+        # KMS customer managed keys have monthly costs
+        cost_info = estimate_kms_cost(
+            pricing_client, region, resource.get("properties", {})
+        )
+    elif resource_type == "AWS::SNS::Topic":
+        # SNS topics have usage-based costs
+        cost_info = estimate_sns_cost(
             pricing_client, region, resource.get("properties", {})
         )
     else:
